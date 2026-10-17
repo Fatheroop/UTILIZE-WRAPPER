@@ -145,7 +145,7 @@ Evaluated using real-time OS process monitoring via `psutil` measuring User + Sy
 Ensure you have Python 3.9+ and PyTorch installed:
 
 ```bash
-git clone https://github.com/your-username/New-Model.git
+git clone https://github.com/Fatheroop/New-Model.git
 cd "New Model"
 pip install torch numpy scikit-learn matplotlib psutil
 ```
