@@ -40,6 +40,7 @@ from typing import List, Dict, Tuple, Optional, Union, Any, Callable, Type
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
@@ -105,6 +106,8 @@ class PrefetchedChunkStreamer:
                     b_idx = perm[i : i + self.batch_size]
                     bx = chunk_x[b_idx]
                     by = chunk_y[b_idx]
+                    if bx.is_floating_point() and bx.dtype != torch.float32:
+                        bx = bx.float()
                     if self.device.type != "cpu":
                         bx = bx.to(self.device, non_blocking=True)
                         by = by.to(self.device, non_blocking=True)
@@ -113,6 +116,8 @@ class PrefetchedChunkStreamer:
                 for i in range(0, n, self.batch_size):
                     bx = chunk_x[i : i + self.batch_size]
                     by = chunk_y[i : i + self.batch_size]
+                    if bx.is_floating_point() and bx.dtype != torch.float32:
+                        bx = bx.float()
                     if self.device.type != "cpu":
                         bx = bx.to(self.device, non_blocking=True)
                         by = by.to(self.device, non_blocking=True)
@@ -146,6 +151,8 @@ class PrefetchedChunkStreamer:
                         b_idx = perm[i : i + self.batch_size]
                         bx = chunk_x[b_idx]
                         by = chunk_y[b_idx]
+                        if bx.is_floating_point() and bx.dtype != torch.float32:
+                            bx = bx.float()
                         if self.device.type != "cpu":
                             bx = bx.to(self.device, non_blocking=True)
                             by = by.to(self.device, non_blocking=True)
@@ -154,6 +161,8 @@ class PrefetchedChunkStreamer:
                     for i in range(0, n, self.batch_size):
                         bx = chunk_x[i : i + self.batch_size]
                         by = chunk_y[i : i + self.batch_size]
+                        if bx.is_floating_point() and bx.dtype != torch.float32:
+                            bx = bx.float()
                         if self.device.type != "cpu":
                             bx = bx.to(self.device, non_blocking=True)
                             by = by.to(self.device, non_blocking=True)
@@ -595,6 +604,8 @@ class StageWrapper(nn.Module):
         out_dim: int,
         task: str = "classification",
         is_final_stage: bool = False,
+        probe_head_depth: int = 1,
+        probe_head_hidden_dim: Optional[int] = None,
     ):
         super().__init__()
         self.body = body
@@ -602,6 +613,8 @@ class StageWrapper(nn.Module):
         self.out_dim = out_dim
         self.task = task
         self.is_final_stage = is_final_stage
+        self.probe_head_depth = probe_head_depth
+        self.probe_head_hidden_dim = probe_head_hidden_dim
 
         # Infer output shape with a dummy forward pass
         was_training = self.body.training
@@ -624,19 +637,41 @@ class StageWrapper(nn.Module):
             pool_w = min(4, self.out_shape[2])
             self.head_pool = nn.AdaptiveAvgPool2d((pool_h, pool_w))
             flat_dim = self.out_shape[0] * pool_h * pool_w
-            self.head = nn.Sequential(
-                self.head_pool,
-                nn.Flatten(),
-                nn.Linear(flat_dim, out_dim),
-            )
+            if self.probe_head_depth >= 2:
+                hidden = self.probe_head_hidden_dim or max(64, flat_dim // 2)
+                self.head = nn.Sequential(
+                    self.head_pool,
+                    nn.Flatten(),
+                    nn.Linear(flat_dim, hidden),
+                    nn.BatchNorm1d(hidden),
+                    nn.ReLU(),
+                    nn.Linear(hidden, out_dim),
+                )
+            else:
+                self.head = nn.Sequential(
+                    self.head_pool,
+                    nn.Flatten(),
+                    nn.Linear(flat_dim, out_dim),
+                )
             self.is_head_identity = False
         else:
             # Flat 1D representation
-            self.head = nn.Linear(self.out_shape[0], out_dim)
+            if self.probe_head_depth >= 2 and not self.is_final_stage:
+                hidden = self.probe_head_hidden_dim or max(64, self.out_shape[0] // 2)
+                self.head = nn.Sequential(
+                    nn.Linear(self.out_shape[0], hidden),
+                    nn.BatchNorm1d(hidden),
+                    nn.ReLU(),
+                    nn.Linear(hidden, out_dim),
+                )
+            else:
+                self.head = nn.Linear(self.out_shape[0], out_dim)
             self.is_head_identity = False
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract intermediate feature representations from the stage body."""
+        if x.is_floating_point() and x.dtype != torch.float32:
+            x = x.float()
         return self.body(x)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -646,6 +681,8 @@ class StageWrapper(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (features, predictions/logits).
         """
+        if x.is_floating_point() and x.dtype != torch.float32:
+            x = x.float()
         feats = self.extract_features(x)
         out = feats if self.is_head_identity else self.head(feats)
         return feats, out
@@ -945,6 +982,15 @@ class ConstructiveWrapper(nn.Module):
         loss_gated_threshold (float, default=0.95): Confidence threshold above which mastered samples skip backprop.
         early_stopping_curvature (bool, default=False): Enable loss-curvature plateau detection for fast stage saturation exit.
         early_stopping_curvature_delta (float, default=0.002): Relative loss change threshold for curvature early exit.
+        activation_precision (str, default="float32"): Activation storage precision ('float32', 'float16', 'bfloat16').
+            Cuts intermediate RAM cache and chunk disk footprint by 50% using AirLLM virtual streaming mechanics.
+        probe_head_depth (int, default=1): Number of layers in stage auxiliary probe heads (1=linear, 2=expressive MLP with BatchNorm/ReLU).
+            Prevents premature linear representation collapse in early convolutional filters (Belilovsky et al., ICML 2019).
+        probe_head_hidden_dim (int, optional): Intermediate hidden dimension for 2-layer auxiliary probe heads.
+        feature_decorrelation (bool, default=False): Enable Barlow Twins / VICReg cross-correlation penalty to prevent neuron collapse.
+        feature_decorrelation_weight (float, default=0.01): Weighting factor for feature covariance decorrelation loss.
+        mixup_alpha (float, default=0.0): Beta distribution parameter for intermediate manifold & input mixup data augmentation.
+        gradient_centralization (bool, default=False): Enable Gradient Centralization (GC) on weight gradients (Yong et al., ECCV 2020).
         device (Union[str, torch.device], optional): Computation device ('cuda', 'cpu').
         random_state (int, default=42): Deterministic pseudo-random seed.
     """
@@ -998,6 +1044,13 @@ class ConstructiveWrapper(nn.Module):
         loss_gated_threshold: float = 0.95,
         early_stopping_curvature: bool = False,
         early_stopping_curvature_delta: float = 0.002,
+        activation_precision: str = "float32",
+        probe_head_depth: int = 1,
+        probe_head_hidden_dim: Optional[int] = None,
+        feature_decorrelation: bool = False,
+        feature_decorrelation_weight: float = 0.01,
+        mixup_alpha: float = 0.0,
+        gradient_centralization: bool = False,
         device: Optional[Union[str, torch.device]] = None,
         random_state: int = 42,
     ):
@@ -1024,6 +1077,19 @@ class ConstructiveWrapper(nn.Module):
         self.loss_gated_threshold = loss_gated_threshold
         self.early_stopping_curvature = early_stopping_curvature
         self.early_stopping_curvature_delta = early_stopping_curvature_delta
+        self.activation_precision = str(activation_precision).lower()
+        if self.activation_precision in ("float16", "half", "fp16"):
+            self.activation_dtype = torch.float16
+        elif self.activation_precision in ("bfloat16", "bf16"):
+            self.activation_dtype = torch.bfloat16
+        else:
+            self.activation_dtype = torch.float32
+        self.probe_head_depth = probe_head_depth
+        self.probe_head_hidden_dim = probe_head_hidden_dim
+        self.feature_decorrelation = feature_decorrelation
+        self.feature_decorrelation_weight = feature_decorrelation_weight
+        self.mixup_alpha = mixup_alpha
+        self.gradient_centralization = gradient_centralization
         self.scheduler_type = scheduler
         self.scheduler_kwargs = scheduler_kwargs or {}
         self.learning_rate = learning_rate
@@ -1106,6 +1172,40 @@ class ConstructiveWrapper(nn.Module):
                 mask = (norms >= threshold).view(out_dim, *([1] * (p.ndim - 1)))
                 p.grad.mul_(mask.float())
 
+    @staticmethod
+    def _apply_gradient_centralization(parameters: Any):
+        """
+        Gradient Centralization (GC) for Convolutional & Linear Layers (Yong et al., ECCV 2020):
+        Zero-centers the gradient vectors across fan-in/kernel dimensions, regularizing weight
+        trajectories, stabilizing optimization dynamics, and accelerating convergence.
+        """
+        with torch.no_grad():
+            for p in parameters:
+                if p.grad is not None and p.ndim >= 2:
+                    dim_tuple = tuple(range(1, p.ndim))
+                    mean = p.grad.data.mean(dim=dim_tuple, keepdim=True)
+                    p.grad.data.sub_(mean)
+
+    @staticmethod
+    def _compute_feature_decorrelation(features: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+        """
+        Barlow Twins / VICReg Information-Theoretic Feature Covariance Decorrelation:
+        Penalizes off-diagonal cross-correlations between feature channels, preventing
+        representation collapse and encouraging filter diversity in constructive layers.
+        """
+        if features.ndim > 2:
+            features = F.adaptive_avg_pool2d(features, (1, 1)).flatten(1)
+        b, d = features.shape
+        if b <= 1 or d <= 1:
+            return torch.tensor(0.0, device=features.device)
+        z = features - features.mean(dim=0, keepdim=True)
+        cov = (z.T @ z) / (b - 1)
+        diag = torch.diag(cov)
+        std = torch.sqrt(torch.clamp(diag, min=eps))
+        corr = cov / (std.unsqueeze(1) * std.unsqueeze(0) + eps)
+        eye = torch.eye(d, device=features.device, dtype=torch.bool)
+        return torch.mean(corr[~eye] ** 2)
+
     def _invalidate_inference_engine(self):
         self._inference_engine = None
 
@@ -1179,6 +1279,8 @@ class ConstructiveWrapper(nn.Module):
                 out_dim=self.out_dim,
                 task=self.task,
                 is_final_stage=is_final,
+                probe_head_depth=self.probe_head_depth,
+                probe_head_hidden_dim=self.probe_head_hidden_dim,
             ).to(self.device)
 
             self.stages_wrapped.append(stage_wrapper)
@@ -1406,18 +1508,20 @@ class ConstructiveWrapper(nn.Module):
                     feat_batch_size = max(self.batch_size * 2, 256)
                     with torch.no_grad():
                         n_train_s = len(curr_train_x)
-                        next_train_x = torch.empty((n_train_s, *stage.out_shape), dtype=torch.float32)
+                        next_train_x = torch.empty((n_train_s, *stage.out_shape), dtype=self.activation_dtype)
                         for bi in range(0, n_train_s, feat_batch_size):
                             be = min(bi + feat_batch_size, n_train_s)
-                            next_train_x[bi:be] = stage.extract_features(curr_train_x[bi:be].to(self.device)).cpu()
+                            feats = stage.extract_features(curr_train_x[bi:be].to(self.device))
+                            next_train_x[bi:be] = feats.to(dtype=self.activation_dtype).cpu()
                         del curr_train_x
                         curr_train_x = next_train_x
                         if curr_val_x is not None:
                             n_val_s = len(curr_val_x)
-                            next_val_x = torch.empty((n_val_s, *stage.out_shape), dtype=torch.float32)
+                            next_val_x = torch.empty((n_val_s, *stage.out_shape), dtype=self.activation_dtype)
                             for bi in range(0, n_val_s, feat_batch_size):
                                 be = min(bi + feat_batch_size, n_val_s)
-                                next_val_x[bi:be] = stage.extract_features(curr_val_x[bi:be].to(self.device)).cpu()
+                                v_feats = stage.extract_features(curr_val_x[bi:be].to(self.device))
+                                next_val_x[bi:be] = v_feats.to(dtype=self.activation_dtype).cpu()
                             del curr_val_x
                             curr_val_x = next_val_x
                         gc.collect()
@@ -1487,12 +1591,16 @@ class ConstructiveWrapper(nn.Module):
         probe_n = min(n_train, self.batch_size * self.eval_probe_batches) if self.eval_probe_batches else n_train
         probe_indices = torch.linspace(0, n_train - 1, probe_n).long()
         probe_train_x = train_x[probe_indices].to(self.device)
+        if probe_train_x.is_floating_point() and probe_train_x.dtype != torch.float32:
+            probe_train_x = probe_train_x.float()
         probe_train_y = train_y[probe_indices].to(self.device)
 
         if val_x is not None and val_y is not None:
             probe_val_n = min(len(val_x), self.batch_size * self.eval_probe_batches) if self.eval_probe_batches else len(val_x)
             probe_v_indices = torch.linspace(0, len(val_x) - 1, probe_val_n).long()
             probe_val_x = val_x[probe_v_indices].to(self.device)
+            if probe_val_x.is_floating_point() and probe_val_x.dtype != torch.float32:
+                probe_val_x = probe_val_x.float()
             probe_val_y = val_y[probe_v_indices].to(self.device)
         else:
             probe_val_x = None
@@ -1572,21 +1680,35 @@ class ConstructiveWrapper(nn.Module):
                 b_idx = perm[i : i + self.batch_size]
                 bx = train_x[b_idx].to(self.device, non_blocking=self.non_blocking)
                 by = train_y[b_idx].to(self.device, non_blocking=self.non_blocking)
+                if bx.is_floating_point() and bx.dtype != torch.float32:
+                    bx = bx.float()
 
                 with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
-                    _, out = stage(bx)
-                    if self.loss_gated_sampling and self.task == "classification":
-                        raw_losses = nn.functional.cross_entropy(out, by, reduction="none")
-                        with torch.no_grad():
-                            probs = torch.softmax(out, dim=1)
-                            conf = probs.gather(1, by.unsqueeze(1)).squeeze(1)
-                            sample_mask = (conf < self.loss_gated_threshold).float()
-                        if sample_mask.sum() > 0:
-                            loss = (raw_losses * sample_mask).sum() / sample_mask.sum()
-                        else:
-                            loss = raw_losses.mean() * 0.0
+                    if self.mixup_alpha > 0.0 and self.task == "classification" and len(bx) > 1:
+                        lam = float(np.random.beta(self.mixup_alpha, self.mixup_alpha))
+                        perm_mix = torch.randperm(bx.size(0))
+                        bx_mix = lam * bx + (1.0 - lam) * bx[perm_mix]
+                        feats, out = stage(bx_mix)
+                        loss = lam * criterion(out, by) + (1.0 - lam) * criterion(out, by[perm_mix])
                     else:
-                        loss = criterion(out, by)
+                        feats, out = stage(bx)
+                        if self.loss_gated_sampling and self.task == "classification":
+                            raw_losses = nn.functional.cross_entropy(out, by, reduction="none")
+                            with torch.no_grad():
+                                probs = torch.softmax(out, dim=1)
+                                conf = probs.gather(1, by.unsqueeze(1)).squeeze(1)
+                                sample_mask = (conf < self.loss_gated_threshold).float()
+                            if sample_mask.sum() > 0:
+                                loss = (raw_losses * sample_mask).sum() / sample_mask.sum()
+                            else:
+                                loss = raw_losses.mean() * 0.0
+                        else:
+                            loss = criterion(out, by)
+
+                    if self.feature_decorrelation and self.feature_decorrelation_weight > 0.0:
+                        decorr_loss = self._compute_feature_decorrelation(feats)
+                        loss = loss + self.feature_decorrelation_weight * decorr_loss
+
                     if self.gradient_accumulation_steps > 1:
                         loss = loss / self.gradient_accumulation_steps
 
@@ -1601,6 +1723,8 @@ class ConstructiveWrapper(nn.Module):
                 if is_accum_step:
                     if scaler.is_enabled():
                         scaler.unscale_(optimizer)
+                        if self.gradient_centralization:
+                            self._apply_gradient_centralization(stage.parameters())
                         if self.selective_gradient and self.selective_gradient_ratio < 1.0:
                             self._apply_selective_gradient(stage.parameters(), ratio=self.selective_gradient_ratio)
                         if self.auto_tune_hyperparams:
@@ -1610,6 +1734,8 @@ class ConstructiveWrapper(nn.Module):
                         scaler.step(optimizer)
                         scaler.update()
                     else:
+                        if self.gradient_centralization:
+                            self._apply_gradient_centralization(stage.parameters())
                         if self.selective_gradient and self.selective_gradient_ratio < 1.0:
                             self._apply_selective_gradient(stage.parameters(), ratio=self.selective_gradient_ratio)
                         if self.auto_tune_hyperparams:
@@ -1753,6 +1879,8 @@ class ConstructiveWrapper(nn.Module):
             p_n = min(len(c0["features"]), self.batch_size * self.eval_probe_batches)
             p_idx = torch.linspace(0, len(c0["features"]) - 1, p_n).long()
             probe_train_x = c0["features"][p_idx].to(self.device)
+            if probe_train_x.is_floating_point() and probe_train_x.dtype != torch.float32:
+                probe_train_x = probe_train_x.float()
             probe_train_y = c0["labels"][p_idx].to(self.device)
             del c0
             if val_store is not None and val_store.chunk_files:
@@ -1760,6 +1888,8 @@ class ConstructiveWrapper(nn.Module):
                 pv_n = min(len(cv0["features"]), self.batch_size * self.eval_probe_batches)
                 pv_idx = torch.linspace(0, len(cv0["features"]) - 1, pv_n).long()
                 probe_val_x = cv0["features"][pv_idx].to(self.device)
+                if probe_val_x.is_floating_point() and probe_val_x.dtype != torch.float32:
+                    probe_val_x = probe_val_x.float()
                 probe_val_y = cv0["labels"][pv_idx].to(self.device)
                 del cv0
             gc.collect()
@@ -1834,10 +1964,24 @@ class ConstructiveWrapper(nn.Module):
             for bx, by in train_streamer:
                 bx = bx.to(self.device, non_blocking=self.non_blocking)
                 by = by.to(self.device, non_blocking=self.non_blocking)
+                if bx.is_floating_point() and bx.dtype != torch.float32:
+                    bx = bx.float()
 
                 with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
-                    _, out = stage(bx)
-                    loss = criterion(out, by)
+                    if self.mixup_alpha > 0.0 and self.task == "classification" and len(bx) > 1:
+                        lam = float(np.random.beta(self.mixup_alpha, self.mixup_alpha))
+                        perm_mix = torch.randperm(bx.size(0))
+                        bx_mix = lam * bx + (1.0 - lam) * bx[perm_mix]
+                        feats, out = stage(bx_mix)
+                        loss = lam * criterion(out, by) + (1.0 - lam) * criterion(out, by[perm_mix])
+                    else:
+                        feats, out = stage(bx)
+                        loss = criterion(out, by)
+
+                    if self.feature_decorrelation and self.feature_decorrelation_weight > 0.0:
+                        decorr_loss = self._compute_feature_decorrelation(feats)
+                        loss = loss + self.feature_decorrelation_weight * decorr_loss
+
                     if self.gradient_accumulation_steps > 1:
                         loss = loss / self.gradient_accumulation_steps
 
@@ -1851,15 +1995,22 @@ class ConstructiveWrapper(nn.Module):
 
                 if is_accum_step:
                     if scaler.is_enabled():
+                        scaler.unscale_(optimizer)
+                        if self.gradient_centralization:
+                            self._apply_gradient_centralization(stage.parameters())
+                        if self.selective_gradient and self.selective_gradient_ratio < 1.0:
+                            self._apply_selective_gradient(stage.parameters(), ratio=self.selective_gradient_ratio)
                         if self.auto_tune_hyperparams:
-                            scaler.unscale_(optimizer)
                             tuner.clip_gradients(stage.parameters())
                         elif self.grad_clip is not None:
-                            scaler.unscale_(optimizer)
                             torch.nn.utils.clip_grad_norm_(stage.parameters(), self.grad_clip)
                         scaler.step(optimizer)
                         scaler.update()
                     else:
+                        if self.gradient_centralization:
+                            self._apply_gradient_centralization(stage.parameters())
+                        if self.selective_gradient and self.selective_gradient_ratio < 1.0:
+                            self._apply_selective_gradient(stage.parameters(), ratio=self.selective_gradient_ratio)
                         if self.auto_tune_hyperparams:
                             tuner.clip_gradients(stage.parameters())
                         elif self.grad_clip is not None:
@@ -1874,9 +2025,18 @@ class ConstructiveWrapper(nn.Module):
 
             if n_batches % self.gradient_accumulation_steps != 0:
                 if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                    if self.gradient_centralization:
+                        self._apply_gradient_centralization(stage.parameters())
+                    if self.selective_gradient and self.selective_gradient_ratio < 1.0:
+                        self._apply_selective_gradient(stage.parameters(), ratio=self.selective_gradient_ratio)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    if self.gradient_centralization:
+                        self._apply_gradient_centralization(stage.parameters())
+                    if self.selective_gradient and self.selective_gradient_ratio < 1.0:
+                        self._apply_selective_gradient(stage.parameters(), ratio=self.selective_gradient_ratio)
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 if ema_model is not None:
@@ -2004,10 +2164,11 @@ class ConstructiveWrapper(nn.Module):
         """Batch-extract features directly into bounded ~2 MB disk chunks without RAM accumulation."""
         stage.eval()
         n = len(X)
-        sample_size_bytes = int(np.prod(stage.out_shape)) * 4 + 8
+        elem_bytes = 2 if self.activation_dtype in (torch.float16, torch.bfloat16) else 4
+        sample_size_bytes = int(np.prod(stage.out_shape)) * elem_bytes + 8
         spc = max(1, store.chunk_size_bytes // sample_size_bytes)
 
-        buf_x = torch.empty((spc, *stage.out_shape), dtype=torch.float32)
+        buf_x = torch.empty((spc, *stage.out_shape), dtype=self.activation_dtype)
         buf_y = torch.empty((spc,), dtype=y.dtype)
         buf_ptr = 0
         chunk_idx = 0
@@ -2020,7 +2181,7 @@ class ConstructiveWrapper(nn.Module):
                 end_i = min(i + batch_sz, n)
                 bx = X[i:end_i].to(self.device)
                 by = y[i:end_i]
-                feats = stage.extract_features(bx).cpu()
+                feats = stage.extract_features(bx).to(dtype=self.activation_dtype).cpu()
                 by_cpu = by.cpu()
                 batch_n = len(feats)
                 r_ptr = 0
@@ -2064,10 +2225,11 @@ class ConstructiveWrapper(nn.Module):
             shuffle=False,
             device=self.device,
         )
-        sample_size_bytes = int(np.prod(stage.out_shape)) * 4 + 8
+        elem_bytes = 2 if self.activation_dtype in (torch.float16, torch.bfloat16) else 4
+        sample_size_bytes = int(np.prod(stage.out_shape)) * elem_bytes + 8
         spc = max(1, dst_store.chunk_size_bytes // sample_size_bytes)
 
-        buf_x = torch.empty((spc, *stage.out_shape), dtype=torch.float32)
+        buf_x = torch.empty((spc, *stage.out_shape), dtype=self.activation_dtype)
         buf_y = None
         buf_ptr = 0
         chunk_idx = 0
@@ -2077,7 +2239,7 @@ class ConstructiveWrapper(nn.Module):
             pending_future = None
             for bx, by in streamer:
                 bx = bx.to(self.device)
-                feats = stage.extract_features(bx).cpu()
+                feats = stage.extract_features(bx).to(dtype=self.activation_dtype).cpu()
                 by_cpu = by.cpu()
                 if buf_y is None:
                     buf_y = torch.empty((spc,), dtype=by.dtype)
@@ -2484,6 +2646,41 @@ class ConstructiveWrapper(nn.Module):
 
         return out_preds
 
+    def predict_proba_tta(
+        self,
+        x: Union[np.ndarray, torch.Tensor],
+        batch_size: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Test-Time Augmentation (TTA) Probability Estimation:
+        Averages softmax prediction distributions over original and horizontally flipped samples for 2D spatial inputs.
+        Falls back seamlessly to standard single-pass inference for 1D tabular/sequential inputs.
+        """
+        probs_orig = self.predict_proba(x, batch_size=batch_size)
+        is_spatial_4d = (hasattr(x, "ndim") and x.ndim == 4)
+        if is_spatial_4d:
+            if isinstance(x, np.ndarray):
+                x_flip = x[:, :, :, ::-1].copy()
+            else:
+                x_flip = torch.flip(x, dims=[-1])
+            probs_flip = self.predict_proba(x_flip, batch_size=batch_size)
+            return 0.5 * (probs_orig + probs_flip)
+        return probs_orig
+
+    def predict_tta(
+        self,
+        x: Union[np.ndarray, torch.Tensor],
+        batch_size: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Test-Time Augmentation (TTA) Inference:
+        Returns ensemble discrete class predictions or regression targets using horizontal flip averaging.
+        """
+        probs = self.predict_proba_tta(x, batch_size=batch_size)
+        if self.task == "classification":
+            return np.argmax(probs, axis=1)
+        return probs
+
     def evaluate(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor]) -> float:
         """Evaluate model: returns accuracy for classification, R^2 score for regression."""
         if hasattr(x, "ndim") and x.ndim == 1:
@@ -2787,6 +2984,13 @@ class AutoConstructiveModel(nn.Module):
         inference_batch_size: Optional[int] = None,
         metric_ema_alpha: float = 0.7,
         non_blocking: bool = True,
+        activation_precision: str = "float32",
+        probe_head_depth: int = 1,
+        probe_head_hidden_dim: Optional[int] = None,
+        feature_decorrelation: bool = False,
+        feature_decorrelation_weight: float = 0.01,
+        mixup_alpha: float = 0.0,
+        gradient_centralization: bool = False,
         device: Optional[Union[str, torch.device]] = None,
         random_state: int = 42,
     ):
@@ -2834,6 +3038,13 @@ class AutoConstructiveModel(nn.Module):
         self.inference_batch_size = inference_batch_size or max(batch_size, 512)
         self.metric_ema_alpha = metric_ema_alpha
         self.non_blocking = non_blocking
+        self.activation_precision = activation_precision
+        self.probe_head_depth = probe_head_depth
+        self.probe_head_hidden_dim = probe_head_hidden_dim
+        self.feature_decorrelation = feature_decorrelation
+        self.feature_decorrelation_weight = feature_decorrelation_weight
+        self.mixup_alpha = mixup_alpha
+        self.gradient_centralization = gradient_centralization
         self.random_state = random_state
 
         if device is None:
@@ -3025,6 +3236,13 @@ class AutoConstructiveModel(nn.Module):
             inference_batch_size=self.inference_batch_size,
             metric_ema_alpha=self.metric_ema_alpha,
             non_blocking=self.non_blocking,
+            activation_precision=self.activation_precision,
+            probe_head_depth=self.probe_head_depth,
+            probe_head_hidden_dim=self.probe_head_hidden_dim,
+            feature_decorrelation=self.feature_decorrelation,
+            feature_decorrelation_weight=self.feature_decorrelation_weight,
+            mixup_alpha=self.mixup_alpha,
+            gradient_centralization=self.gradient_centralization,
             auto_tune_hyperparams=True,
             device=self.device,
             random_state=self.random_state,
@@ -3059,6 +3277,26 @@ class AutoConstructiveModel(nn.Module):
         if self.wrapper is None:
             raise RuntimeError("Model must be fitted via fit() before predict_proba().")
         return self.wrapper.predict_proba(x, batch_size=batch_size)
+
+    def predict_proba_tta(
+        self,
+        x: Union[np.ndarray, torch.Tensor],
+        batch_size: Optional[int] = None,
+    ) -> np.ndarray:
+        """Test-Time Augmentation (TTA) probability estimation with horizontal flip averaging."""
+        if self.wrapper is None:
+            raise RuntimeError("Model must be fitted via fit() before predict_proba_tta().")
+        return self.wrapper.predict_proba_tta(x, batch_size=batch_size)
+
+    def predict_tta(
+        self,
+        x: Union[np.ndarray, torch.Tensor],
+        batch_size: Optional[int] = None,
+    ) -> np.ndarray:
+        """Test-Time Augmentation (TTA) discrete predictions."""
+        if self.wrapper is None:
+            raise RuntimeError("Model must be fitted via fit() before predict_tta().")
+        return self.wrapper.predict_tta(x, batch_size=batch_size)
 
     def evaluate(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor]) -> float:
         if self.wrapper is None:

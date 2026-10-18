@@ -748,6 +748,78 @@ class TestConstructiveModules(unittest.TestCase):
         class_preds = loaded_from_class.predict(X)
         np.testing.assert_array_equal(orig_preds, class_preds)
 
+    def test_breakthrough_techniques_suite(self):
+        """
+        Test modern AI breakthrough techniques suite:
+          1. AirLLM FP16 activation streaming (RAM and chunked disk)
+          2. 2-layer expressive auxiliary probe heads (Belilovsky DGL)
+          3. Barlow Twins / VICReg feature covariance decorrelation
+          4. Intermediate manifold mixup augmentation
+          5. Gradient Centralization (GC)
+          6. Test-Time Augmentation (predict_tta and predict_proba_tta)
+          7. Exact numerical parity when exported to native nn.Sequential
+        """
+        np.random.seed(42)
+        torch.manual_seed(42)
+        X = np.random.randn(64, 1, 14, 14).astype(np.float32)
+        y = np.random.randint(0, 3, size=(64,)).astype(np.int64)
+
+        stages = [
+            torch.nn.Sequential(
+                torch.nn.Conv2d(1, 8, kernel_size=3, padding=1),
+                torch.nn.BatchNorm2d(8),
+                torch.nn.ReLU(),
+                torch.nn.MaxPool2d(2),
+            ),
+            torch.nn.Sequential(
+                torch.nn.Flatten(),
+                torch.nn.Linear(8 * 7 * 7, 32),
+                torch.nn.ReLU(),
+                torch.nn.Linear(32, 3),
+            ),
+        ]
+
+        wrapper = ConstructiveWrapper(
+            stages=stages,
+            in_shape=(1, 14, 14),
+            num_classes=3,
+            batch_size=16,
+            max_epochs_per_stage=2,
+            fine_tune_epochs=1,
+            activation_precision="float16",
+            probe_head_depth=2,
+            feature_decorrelation=True,
+            feature_decorrelation_weight=0.01,
+            mixup_alpha=0.2,
+            gradient_centralization=True,
+            selective_gradient=True,
+            feature_storage="chunked_disk",
+            storage_dir=os.path.join(self.test_dir, "breakthrough_cache"),
+            random_state=42,
+        )
+
+        wrapper.fit(X, y, verbose=False)
+        self.assertEqual(wrapper.activation_dtype, torch.float16)
+        self.assertEqual(wrapper.probe_head_depth, 2)
+        self.assertTrue(wrapper.feature_decorrelation)
+        self.assertTrue(wrapper.gradient_centralization)
+
+        # Test predictions and TTA
+        preds = wrapper.predict(X)
+        self.assertEqual(len(preds), 64)
+        probs_tta = wrapper.predict_proba_tta(X)
+        self.assertEqual(probs_tta.shape, (64, 3))
+        preds_tta = wrapper.predict_tta(X)
+        self.assertEqual(len(preds_tta), 64)
+
+        # Test exact export parity
+        std_model = wrapper.get_standard_model()
+        with torch.no_grad():
+            t_X = torch.from_numpy(X).float()
+            std_out = std_model(t_X).numpy()
+            wrap_out = wrapper(t_X).numpy()
+            np.testing.assert_allclose(std_out, wrap_out, atol=1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()
