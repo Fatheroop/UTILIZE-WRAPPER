@@ -648,6 +648,45 @@ class TestConstructiveModules(unittest.TestCase):
         acc = wrapper.evaluate(X, y)
         self.assertGreaterEqual(acc, 0.75)
 
+    def test_selective_gradient_and_loss_gating(self):
+        """Test Selective Gradient optimization, Loss-Gated sampling, and Curvature Early Stopping."""
+        torch.manual_seed(42)
+        np.random.seed(42)
+        X = torch.randn(160, 6)
+        y = (X[:, 0] + X[:, 1] > 0).long()
+
+        wrapper = ConstructiveWrapper(
+            stages=[
+                torch.nn.Sequential(torch.nn.Linear(6, 16), torch.nn.ReLU()),
+                torch.nn.Sequential(torch.nn.Linear(16, 2)),
+            ],
+            in_shape=(6,),
+            num_classes=2,
+            batch_size=32,
+            learning_rate=0.01,
+            max_epochs_per_stage=4,
+            fine_tune_epochs=2,
+            selective_gradient=True,
+            selective_gradient_ratio=0.80,
+            loss_gated_sampling=True,
+            loss_gated_threshold=0.90,
+            early_stopping_curvature=True,
+            early_stopping_curvature_delta=0.005,
+            random_state=42,
+        )
+        wrapper.fit(X, y, verbose=False)
+        acc = wrapper.evaluate(X, y)
+        self.assertGreaterEqual(acc, 0.70)
+
+        # Verify export parity
+        std_model = wrapper.get_standard_model()
+        std_model.eval()
+        with torch.inference_mode():
+            std_out = std_model(X[:20])
+            std_preds = torch.argmax(std_out, dim=1).numpy()
+            wrapper_preds = wrapper.predict(X[:20].numpy())
+            np.testing.assert_array_equal(wrapper_preds, std_preds)
+
 
 if __name__ == "__main__":
     unittest.main()

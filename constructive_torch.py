@@ -939,6 +939,12 @@ class ConstructiveWrapper(nn.Module):
         inference_batch_size (int, optional): Mini-batch size for `predict` and `predict_proba`. Defaults to max(batch_size, 512).
         metric_ema_alpha (float, default=0.7): Smoothing factor for the 1st-order EMA plateau filter.
         non_blocking (bool, default=True): Non-blocking asynchronous tensor transfers to GPU memory.
+        selective_gradient (bool, default=False): Enable selective neuron/filter responsibility gating.
+        selective_gradient_ratio (float, default=0.85): Fraction of neurons/filters to update based on gradient contribution.
+        loss_gated_sampling (bool, default=False): Enable sample-level loss-gated selective backpropagation (hard example mining).
+        loss_gated_threshold (float, default=0.95): Confidence threshold above which mastered samples skip backprop.
+        early_stopping_curvature (bool, default=False): Enable loss-curvature plateau detection for fast stage saturation exit.
+        early_stopping_curvature_delta (float, default=0.002): Relative loss change threshold for curvature early exit.
         device (Union[str, torch.device], optional): Computation device ('cuda', 'cpu').
         random_state (int, default=42): Deterministic pseudo-random seed.
     """
@@ -986,6 +992,12 @@ class ConstructiveWrapper(nn.Module):
         inference_batch_size: Optional[int] = None,
         metric_ema_alpha: float = 0.7,
         non_blocking: bool = True,
+        selective_gradient: bool = False,
+        selective_gradient_ratio: float = 0.85,
+        loss_gated_sampling: bool = False,
+        loss_gated_threshold: float = 0.95,
+        early_stopping_curvature: bool = False,
+        early_stopping_curvature_delta: float = 0.002,
         device: Optional[Union[str, torch.device]] = None,
         random_state: int = 42,
     ):
@@ -1006,6 +1018,12 @@ class ConstructiveWrapper(nn.Module):
         self.gradient_accumulation_steps = max(1, gradient_accumulation_steps)
         self.warmup_epochs = max(0, warmup_epochs)
         self.non_blocking = non_blocking
+        self.selective_gradient = selective_gradient
+        self.selective_gradient_ratio = selective_gradient_ratio
+        self.loss_gated_sampling = loss_gated_sampling
+        self.loss_gated_threshold = loss_gated_threshold
+        self.early_stopping_curvature = early_stopping_curvature
+        self.early_stopping_curvature_delta = early_stopping_curvature_delta
         self.scheduler_type = scheduler
         self.scheduler_kwargs = scheduler_kwargs or {}
         self.learning_rate = learning_rate
@@ -1062,6 +1080,31 @@ class ConstructiveWrapper(nn.Module):
         if device is not None:
             self._device = torch.device(device)
         return super().to(*args, **kwargs)
+
+    @staticmethod
+    def _apply_selective_gradient(parameters: Any, ratio: float = 0.85):
+        """
+        Selective Gradient Backpropagation (Neuron Responsibility Gating):
+        Zeros out parameter gradients for the bottom (1 - ratio) fraction of neurons/filters
+        with the lowest gradient norm, focusing optimizer momentum strictly on the
+        neurons driving predictive discrimination.
+        """
+        with torch.no_grad():
+            for p in parameters:
+                if p.grad is None or p.ndim < 2:
+                    continue
+                out_dim = p.shape[0]
+                if out_dim <= 4:
+                    continue
+                flat_grads = p.grad.view(out_dim, -1)
+                norms = torch.norm(flat_grads, p=2, dim=1)
+                k = max(1, int(round(out_dim * ratio)))
+                if k >= out_dim:
+                    continue
+                topk_vals, _ = torch.topk(norms, k)
+                threshold = topk_vals[-1]
+                mask = (norms >= threshold).view(out_dim, *([1] * (p.ndim - 1)))
+                p.grad.mul_(mask.float())
 
     def _invalidate_inference_engine(self):
         self._inference_engine = None
@@ -1233,7 +1276,12 @@ class ConstructiveWrapper(nn.Module):
                     ys.append(batch["labels"].cpu() if "labels" in batch else batch["y"].cpu())
             tx = torch.cat(xs, dim=0).float()
             ty = torch.cat(ys, dim=0)
-            ty = ty.long() if self.task == "classification" else ty.float()
+            if self.task == "classification":
+                ty = ty.long()
+            else:
+                ty = ty.float()
+                if ty.ndim == 1 and self.num_classes == 1:
+                    ty = ty.unsqueeze(1)
             return tx, ty
 
         # Explicit X, y passed
@@ -1245,6 +1293,9 @@ class ConstructiveWrapper(nn.Module):
             ty = torch.from_numpy(y).long() if self.task == "classification" else torch.from_numpy(y).float()
         else:
             ty = y.long() if self.task == "classification" else y.float()
+
+        if self.task == "regression" and ty.ndim == 1 and self.num_classes == 1:
+            ty = ty.unsqueeze(1)
 
         return tx, ty
 
@@ -1456,7 +1507,7 @@ class ConstructiveWrapper(nn.Module):
         optimizer, scheduler = self._build_optimizer_and_scheduler(stage)
 
         history: Dict[str, Any] = {"stage_idx": s_idx, "loss": [], "train_acc": [], "val_acc": []}
-        best_metric = -float("inf") if self.task == "classification" else float("inf")
+        best_metric = -float("inf")
         best_loss = float("inf")
         epochs_no_improve = 0
         best_state = None
@@ -1515,7 +1566,18 @@ class ConstructiveWrapper(nn.Module):
 
                 with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                     _, out = stage(bx)
-                    loss = criterion(out, by)
+                    if self.loss_gated_sampling and self.task == "classification":
+                        raw_losses = nn.functional.cross_entropy(out, by, reduction="none")
+                        with torch.no_grad():
+                            probs = torch.softmax(out, dim=1)
+                            conf = probs.gather(1, by.unsqueeze(1)).squeeze(1)
+                            sample_mask = (conf < self.loss_gated_threshold).float()
+                        if sample_mask.sum() > 0:
+                            loss = (raw_losses * sample_mask).sum() / sample_mask.sum()
+                        else:
+                            loss = raw_losses.mean() * 0.0
+                    else:
+                        loss = criterion(out, by)
                     if self.gradient_accumulation_steps > 1:
                         loss = loss / self.gradient_accumulation_steps
 
@@ -1529,15 +1591,18 @@ class ConstructiveWrapper(nn.Module):
 
                 if is_accum_step:
                     if scaler.is_enabled():
+                        scaler.unscale_(optimizer)
+                        if self.selective_gradient and self.selective_gradient_ratio < 1.0:
+                            self._apply_selective_gradient(stage.parameters(), ratio=self.selective_gradient_ratio)
                         if self.auto_tune_hyperparams:
-                            scaler.unscale_(optimizer)
                             tuner.clip_gradients(stage.parameters())
                         elif self.grad_clip is not None:
-                            scaler.unscale_(optimizer)
                             torch.nn.utils.clip_grad_norm_(stage.parameters(), self.grad_clip)
                         scaler.step(optimizer)
                         scaler.update()
                     else:
+                        if self.selective_gradient and self.selective_gradient_ratio < 1.0:
+                            self._apply_selective_gradient(stage.parameters(), ratio=self.selective_gradient_ratio)
                         if self.auto_tune_hyperparams:
                             tuner.clip_gradients(stage.parameters())
                         elif self.grad_clip is not None:
@@ -1595,14 +1660,9 @@ class ConstructiveWrapper(nn.Module):
 
             # Check improvement strictly on target_metric (eliminating false plateau resets)
             improved = False
-            if self.task == "classification":
-                if target_metric > (best_metric + self.min_delta):
-                    best_metric = target_metric
-                    improved = True
-            else:
-                if target_metric < (best_metric - self.min_delta):
-                    best_metric = target_metric
-                    improved = True
+            if target_metric > (best_metric + self.min_delta):
+                best_metric = target_metric
+                improved = True
 
             if improved:
                 epochs_no_improve = 0
@@ -1624,6 +1684,17 @@ class ConstructiveWrapper(nn.Module):
                 if verbose:
                     print(f"    ⭐ Saturated: Plateaued ({self.patience} epochs) at epoch {epoch}.")
                 break
+
+            if self.early_stopping_curvature and len(history["loss"]) >= 3:
+                l_curr = history["loss"][-1]
+                l_prev = history["loss"][-2]
+                l_prev2 = history["loss"][-3]
+                rel_d1 = abs(l_prev - l_curr) / max(1e-5, l_prev)
+                rel_d2 = abs(l_prev2 - l_prev) / max(1e-5, l_prev2)
+                if rel_d1 < self.early_stopping_curvature_delta and rel_d2 < self.early_stopping_curvature_delta:
+                    if verbose:
+                        print(f"    ⚡ C00000urvature Saturated: Loss delta < {self.early_stopping_curvature_delta*100:.2f}% at epoch {epoch}.")
+                    break
 
             # Adaptive retrain pass
             if epoch == current_max_epochs and retrain_passes < self.max_retrains_per_stage:
@@ -1656,7 +1727,7 @@ class ConstructiveWrapper(nn.Module):
         criterion = self._get_loss_fn()
 
         history: Dict[str, Any] = {"stage_idx": s_idx, "loss": [], "train_acc": [], "val_acc": []}
-        best_metric = -float("inf") if self.task == "classification" else float("inf")
+        best_metric = -float("inf")
         best_loss = float("inf")
         epochs_no_improve = 0
         best_state = None
@@ -1846,14 +1917,9 @@ class ConstructiveWrapper(nn.Module):
                 print(f"    Epoch {epoch:2d}/{current_max_epochs} - Loss: {train_loss:.4f}{val_str}")
 
             improved = False
-            if self.task == "classification":
-                if target_metric > (best_metric + self.min_delta):
-                    best_metric = target_metric
-                    improved = True
-            else:
-                if target_metric < (best_metric - self.min_delta):
-                    best_metric = target_metric
-                    improved = True
+            if target_metric > (best_metric + self.min_delta):
+                best_metric = target_metric
+                improved = True
 
             if improved:
                 epochs_no_improve = 0
