@@ -24,7 +24,10 @@ from sklearn.metrics import (
     f1_score,
 )
 
-from core_model import ConstructiveLayerwiseModel
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core_models.core_model import ConstructiveLayerwiseModel
 
 
 def plot_decision_boundary(

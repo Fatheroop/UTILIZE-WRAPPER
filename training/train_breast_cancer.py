@@ -33,9 +33,12 @@ from sklearn.metrics import (
     classification_report,
 )
 
-from core_model import ConstructiveLayerwiseModel
-from standard_mlp import StandardMLPTrainer
-from resource_monitor import ResourceTracker
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core_models.core_model import ConstructiveLayerwiseModel
+from core_models.standard_mlp import StandardMLPTrainer
+from utils.resource_monitor import ResourceTracker
 
 
 def generate_plots(

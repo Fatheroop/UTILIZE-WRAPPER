@@ -12,6 +12,8 @@ Generates empirical metrics and visualization plot: plots/benchmark_selective_op
 """
 
 import os
+import os
+import sys
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,8 +21,10 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, f1_score
 
-from constructive_torch import ConstructiveWrapper
-from benchmark_four_datasets import get_fashion_mnist_dataset
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core_models.constructive_torch import ConstructiveWrapper
+from benchmarks.benchmark_four_datasets import get_fashion_mnist_dataset
 
 def build_conv_network():
     s1 = nn.Sequential(

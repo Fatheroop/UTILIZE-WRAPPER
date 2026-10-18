@@ -23,6 +23,8 @@ import time
 import argparse
 from typing import Dict, Tuple, Any
 
+import sys
+import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -35,8 +37,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score
 
-from constructive_torch import ConstructiveWrapper
-from resource_monitor import ResourceTracker
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core_models.constructive_torch import ConstructiveWrapper
+from utils.resource_monitor import ResourceTracker
 
 
 # ======================================================================

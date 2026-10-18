@@ -16,6 +16,7 @@ Tracks and reports:
   - Visualizations: 4-panel comparative analysis saved to plots/benchmark_comparison.png
 """
 
+import sys
 import os
 import time
 import argparse
@@ -28,9 +29,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import f1_score, accuracy_score
 
-from mnist_dataset import get_normalized_mnist
-from resource_monitor import ResourceTracker
-from constructive_torch import ConstructiveWrapper
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from utils.mnist_dataset import get_normalized_mnist
+from utils.resource_monitor import ResourceTracker
+from core_models.constructive_torch import ConstructiveWrapper
 
 
 def create_lenet5_network(in_shape=(1, 28, 28), num_classes=10) -> nn.Sequential:

@@ -16,6 +16,7 @@ Metrics Evaluated:
 """
 
 import os
+import sys
 import gc
 import time
 from typing import Dict, Tuple, Any
@@ -29,9 +30,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import accuracy_score, f1_score
 
-from constructive_torch import ConstructiveWrapper
-from resource_monitor import ResourceTracker
-from benchmark_four_datasets import (
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core_models.constructive_torch import ConstructiveWrapper
+from utils.resource_monitor import ResourceTracker
+from benchmarks.benchmark_four_datasets import (
     get_moons_dataset,
     build_moons_model,
     get_mnist_dataset,

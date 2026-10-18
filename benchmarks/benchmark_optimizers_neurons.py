@@ -26,8 +26,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from resource_monitor import ResourceTracker
-from constructive_torch import AutoConstructiveModel, ConstructiveWrapper, ArchitecturalAutoTuner
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from utils.resource_monitor import ResourceTracker
+from core_models.constructive_torch import AutoConstructiveModel, ConstructiveWrapper, ArchitecturalAutoTuner
 
 
 class StandardPyTorchMLP(nn.Module):

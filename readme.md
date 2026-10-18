@@ -36,6 +36,7 @@ Train deep neural networks (MLPs, ConvNets, ResNets) progressively one layer at 
   - [6. Selective Gradient & Hard-Negative Loss Gating](#6-selective-gradient--hard-negative-loss-gating)
   - [7. Modern AI Breakthrough Suite (AirLLM FP16 Streaming, 2-Layer Probes, Mixup, GC, TTA)](#7-modern-ai-breakthrough-suite-airllm-fp16-streaming-2-layer-probes-mixup-gc-tta)
   - [8. User Precision Options & Maximum Accuracy Auto-Tuner](#8-user-precision-options--maximum-accuracy-auto-tuner)
+- [Repository Layout & Directory Organization](#repository-layout--directory-organization)
 - [API Reference](#api-reference)
   - [`ConstructiveWrapper`](#constructivewrapper)
   - [`AutoConstructiveModel`](#autoconstructivemodel)
@@ -159,7 +160,7 @@ Input Data X
 - **Loss-Gated Selective Sample Backpropagation**: Mastered training samples with confidence $p_{y_i} \ge 0.95$ are dynamically masked from the backward pass, directing 100% of the gradient capacity to hard boundary examples. This yielded a record **90.20% test accuracy (+1.07% accuracy boost)** on Fashion-MNIST while boosting training throughput from **354 $\to$ 404 samples/second**.
 - **Combined Synergistic Throughput**: When combined with Curvature Early Stopping, throughput reached **410 samples/second (1.16x speedup)** with **89.67% test accuracy**.
 
-![Modern AI Breakthrough Suite Benchmarks](benchmark_modern_breakthroughs1.png)
+![Modern AI Breakthrough Suite Benchmarks](plots/benchmark_modern_breakthroughs1.png)
 
 ### 8. AirLLM-Style Layer-Wise FP16 Virtual Memory Streaming (Exact 50.0% Footprint Reduction)
 - Inspired by AirLLM's memory-bounded layer execution, intermediate activations are compressed on the fly into half-precision (`float16`).
@@ -755,6 +756,72 @@ wrapper.fit(X_train, y_train, X_val, y_val)
 
 ---
 
+## Repository Layout & Directory Organization
+
+The codebase is engineered with clean modular separation across dedicated folders for core models, benchmark suites, training scripts, utilities, and tests:
+
+```
+New Model/
+├── core_models/                       # Core progressive constructive architectures & baselines
+│   ├── __init__.py                    # High-level package exports
+│   ├── constructive_torch.py          # Universal Progressive Constructive Wrapper & Auto-Tuner
+│   ├── core_model.py                  # Constructive Layer-Wise MLP Engine
+│   ├── lenet5_disk_model.py           # Disk-Streamed Chunked LeNet-5 Architecture
+│   ├── standard_lenet5.py             # Baseline LeNet-5 Architecture & Trainer
+│   └── standard_mlp.py                # Baseline Multi-Layer Perceptron (MLP) Trainer
+│
+├── models/                            # High-level package alias to core_models
+│   └── __init__.py
+│
+├── benchmarks/                        # Empirical benchmark suites & head-to-head evaluations
+│   ├── __init__.py
+│   ├── benchmark_4xor.py              # Canonical non-linear parity benchmark (4-Bit XOR)
+│   ├── benchmark_advanced_optimizations.py # Selective gradient & loss gating benchmarks
+│   ├── benchmark_comparison.py        # Framework vs Standard PyTorch comparison
+│   ├── benchmark_cpu_efficiency.py    # CPU energy, utilization & FLOPs benchmark
+│   ├── benchmark_deep_complex_task.py # Deep 8-stage network on complex manifolds
+│   ├── benchmark_four_datasets.py     # 4-dataset comprehensive evaluation suite
+│   ├── benchmark_optimizers_neurons.py# In-situ hyperparameter & neuron tournament search
+│   └── benchmark_performance_techniques.py # AirLLM FP16, DGL probes, Mixup, GC benchmarks
+│
+├── training/                          # Dataset training scripts and runnable examples
+│   ├── __init__.py
+│   ├── train_breast_cancer.py         # Clinical diagnostic training example
+│   ├── train_mnist_lenet5.py          # Progressive LeNet-5 on MNIST digits
+│   └── train_moons.py                 # Non-linear classification on Two Moons
+│
+├── utils/                             # Shared utilities, loaders & telemetry
+│   ├── __init__.py
+│   ├── resource_monitor.py            # Live CPU, RSS RAM, and training telemetry tracker
+│   └── mnist_dataset.py               # Zero-overhead binary dataset loaders
+│
+├── tests/                             # Test suites and verification audits
+│   ├── __init__.py
+│   ├── test_suite.py                  # 21-test automated unit test suite
+│   └── test_all_wrapper_features.py   # Comprehensive wrapper end-to-end audit
+│
+├── plots/                             # Generated benchmark plots & comparison figures (13 figures)
+├── media/                             # Video demonstrations and promotion assets
+├── data/                              # Downloaded dataset binary caches (git-ignored)
+└── scratch/                           # Research scratch scripts and verification audits
+```
+
+### Clean Import Compatibility
+All components support modular imports, package aliases, and root backward-compatible forwarders:
+```python
+# 1. From the modular core_models package
+from core_models import ConstructiveWrapper, AutoConstructiveModel
+from core_models.constructive_torch import ConstructiveWrapper
+
+# 2. From the models package alias
+from models import ConstructiveWrapper, AutoConstructiveModel
+
+# 3. Direct top-level forwarders (100% backward compatible)
+from constructive_torch import ConstructiveWrapper, AutoConstructiveModel
+```
+
+---
+
 ## API Reference
 
 ### `ConstructiveWrapper`
@@ -902,7 +969,7 @@ python scratch/test_modern_breakthroughs.py
 
 Run the advanced optimization benchmark:
 ```bash
-python benchmark_advanced_optimizations.py
+python benchmarks/benchmark_advanced_optimizations.py
 ```
 
 ---

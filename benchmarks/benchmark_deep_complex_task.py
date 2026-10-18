@@ -35,9 +35,11 @@ from sklearn.metrics import accuracy_score, f1_score
 from sklearn.datasets import make_classification
 from sklearn.model_selection import train_test_split
 
-from constructive_torch import ConstructiveWrapper
-from resource_monitor import ResourceTracker
-from benchmark_four_datasets import (
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core_models.constructive_torch import ConstructiveWrapper
+from utils.resource_monitor import ResourceTracker
+from benchmarks.benchmark_four_datasets import (
     get_fashion_mnist_dataset,
     measure_latency_per_1k,
 )

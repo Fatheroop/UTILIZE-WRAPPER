@@ -12,12 +12,17 @@ Tests and quantifies modern techniques across:
 
 import os
 import gc
+import os
+import sys
 import time
 import tracemalloc
 import numpy as np
 import torch
 import torch.nn as nn
-from constructive_torch import ConstructiveWrapper, AutoConstructiveModel
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core_models.constructive_torch import ConstructiveWrapper, AutoConstructiveModel
 
 
 def benchmark_inference_zero_copy():

@@ -12,8 +12,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
 
-from mnist_dataset import get_normalized_mnist
-from lenet5_disk_model import DiskConstructiveLeNet5
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from utils.mnist_dataset import get_normalized_mnist
+from core_models.lenet5_disk_model import DiskConstructiveLeNet5
 
 
 def main():
