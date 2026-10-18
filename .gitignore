@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pt
+test_scratch_checkpoints/
+constructive_model_cache/
+test_verify_cache/
+.DS_Store
