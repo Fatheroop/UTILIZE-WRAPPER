@@ -11,6 +11,10 @@ Train deep neural networks (MLPs, ConvNets, ResNets) progressively one layer at 
 - [How It Works (Framework Architecture)](#how-it-works-framework-architecture)
 - [Key Advantages (With Visual Proof)](#key-advantages-with-visual-proof)
 - [Disadvantages & Systematic Mitigations (With Visual Proof)](#disadvantages--systematic-mitigations-with-visual-proof)
+- [When to Use (and When NOT to Use) This Wrapper](#when-to-use-and-when-not-to-use-this-wrapper)
+  - [Why You Should Use It (Ideal Use Cases)](#why-you-should-use-it-ideal-use-cases)
+  - [When You Should NOT Use It (When Standard PyTorch is Better)](#when-you-should-not-use-it-when-standard-pytorch-is-better)
+  - [Decision Matrix: Constructive Wrapper vs. Standard PyTorch](#decision-matrix-constructive-wrapper-vs-standard-pytorch)
 - [Comprehensive Empirical Benchmarks](#comprehensive-empirical-benchmarks)
   - [1. Head-to-Head Dataset Comparison (With vs. Without Wrapper)](#1-head-to-head-dataset-comparison-with-vs-without-wrapper)
   - [2. CPU Utilization, Core Load & Throughput](#2-cpu-utilization-core-load--throughput)
@@ -191,6 +195,65 @@ While constructive learning delivers dramatic efficiency and throughput benefits
     $$\kappa_{\text{default}} = 0.85 \quad (\text{updates top 85\% discriminative neurons}), \quad \tau_{\text{default}} = 0.95 \quad (\text{only filters samples with } \ge 95\% \text{ certainty})$$
   - Neuron saliency norms are computed dynamically per-mini-batch; dormant neurons that become informative on subsequent batches immediately regain full gradient updates without permanent feature suppression.
   - The feature is **100% strictly opt-in** (`selective_gradient=False`, `loss_gated_sampling=False` by default), ensuring complete backward compatibility and predictability.
+
+---
+
+## When to Use (and When NOT to Use) This Wrapper
+
+To help you decide if `ConstructiveWrapper` is the right architectural choice for your project, here is an honest engineering guide comparing constructive progressive learning against standard monolithic PyTorch backpropagation.
+
+### Why You SHOULD Use It (Ideal Use Cases)
+
+#### 1. Datasets Exceeding System RAM or GPU VRAM ($O(1)$ Bounded Memory)
+- **The Problem**: Standard PyTorch requires allocating huge intermediate activation tensors across all layers during backpropagation. When training large datasets or high-resolution images, systems crash with `CUDA out of memory` or OS process `OOM-Killed`.
+- **Why Use the Wrapper**: With `feature_storage="chunked_disk"`, intermediate representations are written to bounded ~2 MB disk chunk files. Double-buffered asynchronous threads prefetch the next chunk from disk in the background, keeping RAM completely flat ($O(1)$ memory bound). You can train on 50 GB+ datasets on a machine with only 8 GB of RAM.
+
+#### 2. Compute-Constrained, CPU, or Energy-Sensitive Environments
+- **The Problem**: Cloud instances charge by CPU-hour or GPU-hour. Monolithic backpropagation expends massive compute recalculating gradients for bottom layers that already converged within the first few epochs.
+- **Why Use the Wrapper**: Once an early feature extractor saturates, it is permanently frozen. Its activations are extracted once and reused, slashing total CPU compute effort by **38% to 63%** and boosting training throughput by **2.0x to 5.0x**.
+
+#### 3. Deep Feed-Forward Networks Suffering from Vanishing Gradients
+- **The Problem**: In deep MLPs or ConvNets without residual skip connections, gradients diminish exponentially as they traverse backward through 8 to 16 layers, causing bottom layers to stall.
+- **Why Use the Wrapper**: Every constructive stage optimizes a direct local supervised loss ($d=1$). The local auxiliary probe head guarantees healthy, un-attenuated gradient signals to every single layer, yielding a **+2.65% accuracy boost** on complex 64-dimensional manifolds (81.10% vs. 78.45%).
+
+#### 4. Automated Architecture Discovery Without External Heavyweight Tooling
+- **The Problem**: Setting up Optuna, Ray Tune, or Grid Search requires separate databases, multi-process management, and dozens of full-network training runs that burn hours of compute.
+- **Why Use the Wrapper**: `AutoConstructiveModel` runs micro-batch tournament passes layer-by-layer directly on your data, automatically discovering the optimal number of layers, neurons per stage (32 vs 64 vs 128), activation functions (ReLU, GELU, SiLU), and optimizers (Adam, AdamW, SGD, RMSprop) on the fly.
+
+#### 5. Strict Zero-Vendor-Lock-in Deployment Requirements
+- **The Problem**: Many custom PyTorch frameworks force you to install their proprietary Python packages in production or rewrite your inference pipeline.
+- **Why Use the Wrapper**: Calling `.get_standard_model()` returns a **100% native PyTorch `nn.Sequential`** with **exact 0.000000 parity**. You can deploy it with pure PyTorch, TorchScript JIT, dynamic INT8 quantization, or C++ LibTorch with zero dependency on this wrapper.
+
+---
+
+### When You Should NOT Use It (When Standard PyTorch is Better)
+
+#### 1. Massive Distributed Multi-Node / Multi-GPU Training (FSDP / DeepSpeed / Megatron)
+- **Why Avoid**: If you are training billion-parameter foundation models across multi-node GPU clusters using Fully Sharded Data Parallel (FSDP), Tensor Parallelism, or Megatron-LM, standard PyTorch's native distributed autograd engine and all-reduce ring topology are strictly optimized for full-graph backward synchronization. Constructive layer-by-layer training is designed for single-node / multi-core and bounded-memory systems.
+
+#### 2. Complex Dense Skip Graphs & Global Cross-Layer Attention (Transformers, DenseNets)
+- **Why Avoid**: Transformers (BERT, GPT, Vision Transformers) rely on global multi-head self-attention where every token attends across layers, and DenseNets concatenate feature maps from all preceding layers ($x_k = [x_0, x_1, \dots, x_{k-1}]$). Constructive stage wrapping expects sequential or block-hierarchical stage pipelines (`Conv+Pool`, `Dense+Act`, `ResNet blocks`).
+
+#### 3. Small Datasets on High-End Unconstrained GPUs (A100 / H100 / RTX 4090)
+- **Why Avoid**: If your entire dataset easily fits into 40 GB–80 GB of GPU VRAM and your training time is already under 30 seconds, monolithic backpropagation in cuDNN fp16 is already near-optimal. Setting up stage wrappers and disk chunk buffers introduces unnecessary architectural overhead when hardware is unconstrained.
+
+#### 4. Tasks Requiring Continuous End-to-End Co-Adaptation from Epoch 1 (GANs / Minimax)
+- **Why Avoid**: Certain specialized multi-task vision models or generative adversarial networks (GANs) require that lowest-level perceptual filters continually morph in response to shifting global adversarial feedback across every mini-batch. While our global fine-tuning stage mitigates greedy boundary issues for classification and regression, GAN discriminator-generator minimax games are better trained end-to-end.
+
+---
+
+### Decision Matrix: Constructive Wrapper vs. Standard PyTorch
+
+| Project Constraint / Requirement | Standard PyTorch End-to-End | Constructive PyTorch Wrapper | Recommended Choice |
+|---|:---:|:---:|:---:|
+| **Dataset Larger Than Host RAM** | ❌ OOM Crash | ✅ Bounded ~2MB Chunk Streaming | **ConstructiveWrapper** |
+| **CPU / Edge / Energy-Constrained Training** | ❌ High CPU energy (140+ CPU-sec) | ✅ 38%–63% Lower CPU Compute | **ConstructiveWrapper** |
+| **Deep Non-Residual Networks (Vanishing Gradients)**| ❌ Stalls at shallow minima (78.4%) | ✅ Direct Local Gradient ($d=1$, 81.1%) | **ConstructiveWrapper** |
+| **Rapid Automated Layer/Neuron Search** | ❌ Requires complex external tuning | ✅ Built-in In-Situ Tournament Search | **ConstructiveWrapper** |
+| **Export to Pure PyTorch C++ / TorchScript** | ✅ Native Support | ✅ Native Export (0.000000 Parity) | **Tie (Both Supported)** |
+| **Small Dataset on High-End GPU (A100/H100)** | ✅ Blazing fast cuDNN execution | ⚠️ Slight wrapping overhead | **Standard PyTorch** |
+| **Massive Multi-Node Cluster (FSDP / Megatron)**| ✅ Native Distributed Autograd | ❌ Not designed for multi-node FSDP | **Standard PyTorch** |
+| **Cross-Layer Attention (Transformers / LLMs)** | ✅ Native Multi-Head Attention | ❌ Built for sequential stage pipelines | **Standard PyTorch** |
 
 ---
 
