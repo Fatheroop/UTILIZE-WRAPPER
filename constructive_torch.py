@@ -306,6 +306,7 @@ class InSituHyperparameterTuner:
         max_lr: float = 0.03,
         lr_multipliers: Optional[List[float]] = None,
         enabled: bool = True,
+        objective: str = "max_accuracy",
     ):
         self.module = module
         self.optimizer = optimizer
@@ -314,8 +315,9 @@ class InSituHyperparameterTuner:
         self.stage_idx = stage_idx
         self.min_lr = min_lr
         self.max_lr = max_lr
-        self.base_multipliers = lr_multipliers or [0.65, 0.85, 1.0, 1.25, 1.55]
+        self.base_multipliers = lr_multipliers or [0.60, 0.80, 0.95, 1.0, 1.15, 1.35, 1.65]
         self.enabled = enabled
+        self.objective = str(objective).lower()
         self.history: List[Dict[str, Any]] = []
         self.ema_grad_norm = 1.0
         self.ema_gen_gap = 0.0
@@ -426,9 +428,25 @@ class InSituHyperparameterTuner:
 
         v_loss = self.criterion(v_out, target_val_y).item()
         if self.task == "classification":
-            v_acc = float((torch.argmax(v_out, dim=1) == target_val_y).float().mean().item())
-            # Pareto multi-objective score: accuracy primary with smooth curvature regularization
-            score = v_acc - 0.02 * min(v_loss, 10.0)
+            preds = torch.argmax(v_out, dim=1)
+            v_acc = float((preds == target_val_y).float().mean().item())
+            if self.objective == "max_accuracy":
+                probs = torch.softmax(v_out.float(), dim=1)
+                num_classes = probs.shape[1]
+                target_clamped = target_val_y.clamp(0, num_classes - 1)
+                p_correct = probs.gather(1, target_clamped.unsqueeze(1)).squeeze(1)
+                if num_classes > 1:
+                    mask = torch.ones_like(probs, dtype=torch.bool)
+                    mask.scatter_(1, target_clamped.unsqueeze(1), False)
+                    p_runner_up = probs[mask].view(probs.shape[0], num_classes - 1).max(dim=1).values
+                    margin = float((p_correct - p_runner_up).mean().item())
+                else:
+                    margin = float(p_correct.mean().item())
+                # Accuracy primary (100x), decision margin tie-breaker (1x), loss minor regularizer (-0.01x)
+                score = (v_acc * 100.0) + margin - 0.01 * min(v_loss, 10.0)
+            else:
+                # Pareto multi-objective score: accuracy primary with smooth curvature regularization
+                score = v_acc - 0.02 * min(v_loss, 10.0)
         else:
             v_acc = -v_loss
             score = -v_loss
@@ -509,12 +527,30 @@ class InSituHyperparameterTuner:
                 v_loss, v_acc, score = self._eval_candidate(
                     cand_lr, target_val_x, target_val_y, params, grads, directions
                 )
+                if probe_val_x is not None and probe_train_x is not None and self.objective == "max_accuracy":
+                    tr_loss, tr_acc, tr_score = self._eval_candidate(
+                        cand_lr, probe_train_x, probe_train_y, params, grads, directions
+                    )
+                    score = 0.85 * score + 0.15 * tr_score
                 eval_results.append((cand_lr, v_loss, v_acc, score))
                 if score > best_score:
                     best_score = score
                     best_lr = cand_lr
                     best_cand_loss = v_loss
                     best_cand_acc = v_acc
+
+            # Sub-grid fine exploration around best_lr for maximum accuracy
+            if self.objective == "max_accuracy" and best_lr > self.min_lr:
+                for sub_m in [0.92, 1.08]:
+                    sub_lr = max(self.min_lr, min(self.max_lr, best_lr * sub_m))
+                    sub_loss, sub_acc, sub_score = self._eval_candidate(
+                        sub_lr, target_val_x, target_val_y, params, grads, directions
+                    )
+                    if sub_score > best_score:
+                        best_score = sub_score
+                        best_lr = sub_lr
+                        best_cand_loss = sub_loss
+                        best_cand_acc = sub_acc
 
             # Continuous Parabolic Vertex Interpolation for Sub-Grid Precision
             best_idx = max(range(len(eval_results)), key=lambda i: eval_results[i][3])
@@ -786,8 +822,20 @@ class ArchitecturalAutoTuner:
                 _, v_out = stage(probe_val_x)
                 v_loss = criterion(v_out, probe_val_y).item()
                 if stage.task == "classification":
-                    v_acc = float((torch.argmax(v_out, dim=1) == probe_val_y).float().mean().item())
-                    score = v_acc - loss_penalty_weight * min(v_loss, 10.0)
+                    preds = torch.argmax(v_out, dim=1)
+                    v_acc = float((preds == probe_val_y).float().mean().item())
+                    probs = torch.softmax(v_out.float(), dim=1)
+                    num_classes = probs.shape[1]
+                    target_clamped = probe_val_y.clamp(0, num_classes - 1)
+                    p_correct = probs.gather(1, target_clamped.unsqueeze(1)).squeeze(1)
+                    if num_classes > 1:
+                        mask = torch.ones_like(probs, dtype=torch.bool)
+                        mask.scatter_(1, target_clamped.unsqueeze(1), False)
+                        p_runner_up = probs[mask].view(probs.shape[0], num_classes - 1).max(dim=1).values
+                        margin = float((p_correct - p_runner_up).mean().item())
+                    else:
+                        margin = float(p_correct.mean().item())
+                    score = (v_acc * 100.0) + margin - loss_penalty_weight * min(v_loss, 5.0)
                 else:
                     v_acc = -v_loss
                     score = -v_loss
@@ -900,8 +948,20 @@ class ArchitecturalAutoTuner:
                         _, v_out = stage_wrap(probe_val_x)
                         v_loss = criterion(v_out, probe_val_y).item()
                         if task == "classification":
-                            v_acc = float((torch.argmax(v_out, dim=1) == probe_val_y).float().mean().item())
-                            score = v_acc - loss_penalty_weight * min(v_loss, 10.0)
+                            preds = torch.argmax(v_out, dim=1)
+                            v_acc = float((preds == probe_val_y).float().mean().item())
+                            probs = torch.softmax(v_out.float(), dim=1)
+                            num_classes = probs.shape[1]
+                            target_clamped = probe_val_y.clamp(0, num_classes - 1)
+                            p_correct = probs.gather(1, target_clamped.unsqueeze(1)).squeeze(1)
+                            if num_classes > 1:
+                                mask = torch.ones_like(probs, dtype=torch.bool)
+                                mask.scatter_(1, target_clamped.unsqueeze(1), False)
+                                p_runner_up = probs[mask].view(probs.shape[0], num_classes - 1).max(dim=1).values
+                                margin = float((p_correct - p_runner_up).mean().item())
+                            else:
+                                margin = float(p_correct.mean().item())
+                            score = (v_acc * 100.0) + margin - loss_penalty_weight * min(v_loss, 5.0)
                         else:
                             v_acc = -v_loss
                             score = -v_loss
@@ -1045,6 +1105,9 @@ class ConstructiveWrapper(nn.Module):
         early_stopping_curvature: bool = False,
         early_stopping_curvature_delta: float = 0.002,
         activation_precision: str = "float32",
+        precision: Optional[str] = None,
+        amp_dtype: Optional[str] = None,
+        auto_tune_objective: str = "max_accuracy",
         probe_head_depth: int = 1,
         probe_head_hidden_dim: Optional[int] = None,
         feature_decorrelation: bool = False,
@@ -1077,6 +1140,10 @@ class ConstructiveWrapper(nn.Module):
         self.loss_gated_threshold = loss_gated_threshold
         self.early_stopping_curvature = early_stopping_curvature
         self.early_stopping_curvature_delta = early_stopping_curvature_delta
+        
+        # User precision options
+        if precision is not None:
+            activation_precision = precision
         self.activation_precision = str(activation_precision).lower()
         if self.activation_precision in ("float16", "half", "fp16"):
             self.activation_dtype = torch.float16
@@ -1084,6 +1151,18 @@ class ConstructiveWrapper(nn.Module):
             self.activation_dtype = torch.bfloat16
         else:
             self.activation_dtype = torch.float32
+
+        self.amp_dtype_val = None
+        if amp_dtype is not None:
+            ad = str(amp_dtype).lower()
+            if ad in ("float16", "fp16", "half"):
+                self.amp_dtype_val = torch.float16
+            elif ad in ("bfloat16", "bf16"):
+                self.amp_dtype_val = torch.bfloat16
+            else:
+                self.amp_dtype_val = torch.float32
+
+        self.auto_tune_objective = str(auto_tune_objective).lower()
         self.probe_head_depth = probe_head_depth
         self.probe_head_hidden_dim = probe_head_hidden_dim
         self.feature_decorrelation = feature_decorrelation
@@ -1636,7 +1715,7 @@ class ConstructiveWrapper(nn.Module):
         ema_model = ModelEMA(stage, decay=self.ema_decay) if self.use_ema else None
         device_type = self.device.type
         amp_enabled = self.use_amp and device_type in ("cuda", "cpu")
-        amp_dtype = torch.float16 if device_type == "cuda" else torch.bfloat16
+        amp_dtype = self.amp_dtype_val if self.amp_dtype_val is not None else (torch.float16 if device_type == "cuda" else torch.bfloat16)
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled and device_type == "cuda")
 
         tuner = InSituHyperparameterTuner(
@@ -1649,6 +1728,7 @@ class ConstructiveWrapper(nn.Module):
             max_lr=self.max_lr,
             lr_multipliers=self.auto_tune_lr_multipliers,
             enabled=self.auto_tune_hyperparams,
+            objective=self.auto_tune_objective,
         )
 
         while epoch < current_max_epochs:
@@ -1914,7 +1994,7 @@ class ConstructiveWrapper(nn.Module):
         ema_model = ModelEMA(stage, decay=self.ema_decay) if self.use_ema else None
         device_type = self.device.type
         amp_enabled = self.use_amp and device_type in ("cuda", "cpu")
-        amp_dtype = torch.float16 if device_type == "cuda" else torch.bfloat16
+        amp_dtype = self.amp_dtype_val if self.amp_dtype_val is not None else (torch.float16 if device_type == "cuda" else torch.bfloat16)
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled and device_type == "cuda")
 
         tuner = InSituHyperparameterTuner(
@@ -1927,6 +2007,7 @@ class ConstructiveWrapper(nn.Module):
             max_lr=self.max_lr,
             lr_multipliers=self.auto_tune_lr_multipliers,
             enabled=self.auto_tune_hyperparams,
+            objective=self.auto_tune_objective,
         )
 
         while epoch < current_max_epochs:
@@ -2325,7 +2406,7 @@ class ConstructiveWrapper(nn.Module):
         ema_model = ModelEMA(self, decay=self.ema_decay) if self.use_ema else None
         device_type = self.device.type
         amp_enabled = self.use_amp and device_type in ("cuda", "cpu")
-        amp_dtype = torch.float16 if device_type == "cuda" else torch.bfloat16
+        amp_dtype = self.amp_dtype_val if self.amp_dtype_val is not None else (torch.float16 if device_type == "cuda" else torch.bfloat16)
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled and device_type == "cuda")
 
         n_train = len(tx)
@@ -2369,6 +2450,7 @@ class ConstructiveWrapper(nn.Module):
             max_lr=min(self.max_lr, 0.005),
             lr_multipliers=[0.75, 0.9, 1.0, 1.15, 1.3],
             enabled=self.auto_tune_hyperparams,
+            objective=self.auto_tune_objective,
         )
 
         for ep in range(1, epochs + 1):
@@ -2985,6 +3067,9 @@ class AutoConstructiveModel(nn.Module):
         metric_ema_alpha: float = 0.7,
         non_blocking: bool = True,
         activation_precision: str = "float32",
+        precision: Optional[str] = None,
+        amp_dtype: Optional[str] = None,
+        auto_tune_objective: str = "max_accuracy",
         probe_head_depth: int = 1,
         probe_head_hidden_dim: Optional[int] = None,
         feature_decorrelation: bool = False,
@@ -3038,7 +3123,11 @@ class AutoConstructiveModel(nn.Module):
         self.inference_batch_size = inference_batch_size or max(batch_size, 512)
         self.metric_ema_alpha = metric_ema_alpha
         self.non_blocking = non_blocking
+        if precision is not None:
+            activation_precision = precision
         self.activation_precision = activation_precision
+        self.amp_dtype = amp_dtype
+        self.auto_tune_objective = auto_tune_objective
         self.probe_head_depth = probe_head_depth
         self.probe_head_hidden_dim = probe_head_hidden_dim
         self.feature_decorrelation = feature_decorrelation
@@ -3237,6 +3326,8 @@ class AutoConstructiveModel(nn.Module):
             metric_ema_alpha=self.metric_ema_alpha,
             non_blocking=self.non_blocking,
             activation_precision=self.activation_precision,
+            amp_dtype=self.amp_dtype,
+            auto_tune_objective=self.auto_tune_objective,
             probe_head_depth=self.probe_head_depth,
             probe_head_hidden_dim=self.probe_head_hidden_dim,
             feature_decorrelation=self.feature_decorrelation,

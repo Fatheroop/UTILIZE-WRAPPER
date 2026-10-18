@@ -820,6 +820,46 @@ class TestConstructiveModules(unittest.TestCase):
             wrap_out = wrapper(t_X).numpy()
             np.testing.assert_allclose(std_out, wrap_out, atol=1e-5)
 
+    def test_user_precision_options_and_accuracy_auto_tuning(self):
+        """Test user precision configuration options (float16, bfloat16, amp_dtype) and accuracy auto-tuner."""
+        from constructive_torch import ConstructiveWrapper, AutoConstructiveModel, InSituHyperparameterTuner
+
+        model = torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.ReLU(), torch.nn.Linear(16, 2))
+        
+        # Test precision alias and bfloat16
+        w_bf16 = ConstructiveWrapper(model=model, in_shape=(8,), num_classes=2, precision="bfloat16")
+        self.assertEqual(w_bf16.activation_dtype, torch.bfloat16)
+
+        # Test fp16
+        w_fp16 = ConstructiveWrapper(model=model, in_shape=(8,), num_classes=2, precision="float16")
+        self.assertEqual(w_fp16.activation_dtype, torch.float16)
+
+        # Test amp_dtype
+        w_amp = ConstructiveWrapper(model=model, in_shape=(8,), num_classes=2, use_amp=True, amp_dtype="bfloat16")
+        self.assertEqual(w_amp.amp_dtype_val, torch.bfloat16)
+
+        # Test max_accuracy objective in InSituHyperparameterTuner
+        opt = torch.optim.Adam(model.parameters(), lr=0.001)
+        tuner = InSituHyperparameterTuner(
+            module=model,
+            optimizer=opt,
+            criterion=torch.nn.CrossEntropyLoss(),
+            objective="max_accuracy"
+        )
+        self.assertEqual(tuner.objective, "max_accuracy")
+        tx = torch.randn(32, 8)
+        ty = torch.randint(0, 2, (32,))
+        rec = tuner.step_epoch(1, tx, ty, tx, ty, verbose=False)
+        self.assertIn("chosen_lr", rec)
+
+        # Test AutoConstructiveModel forwarding
+        auto_m = AutoConstructiveModel(
+            in_shape=8, num_classes=2, max_stages=1,
+            precision="float16", auto_tune_objective="max_accuracy"
+        )
+        self.assertEqual(auto_m.activation_precision, "float16")
+        self.assertEqual(auto_m.auto_tune_objective, "max_accuracy")
+
 
 if __name__ == "__main__":
     unittest.main()
