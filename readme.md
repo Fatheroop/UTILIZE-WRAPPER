@@ -158,7 +158,7 @@ Input Data X
 - **Loss-Gated Selective Sample Backpropagation**: Mastered training samples with confidence $p_{y_i} \ge 0.95$ are dynamically masked from the backward pass, directing 100% of the gradient capacity to hard boundary examples. This yielded a record **90.20% test accuracy (+1.07% accuracy boost)** on Fashion-MNIST while boosting training throughput from **354 $\to$ 404 samples/second**.
 - **Combined Synergistic Throughput**: When combined with Curvature Early Stopping, throughput reached **410 samples/second (1.16x speedup)** with **89.67% test accuracy**.
 
-![Modern AI Breakthrough Suite Benchmarks](benchmark_modern_breakthroughsu1.png)
+![Modern AI Breakthrough Suite Benchmarks](benchmark_modern_breakthroughs1.png)
 
 ### 8. AirLLM-Style Layer-Wise FP16 Virtual Memory Streaming (Exact 50.0% Footprint Reduction)
 - Inspired by AirLLM's memory-bounded layer execution, intermediate activations are compressed on the fly into half-precision (`float16`).
