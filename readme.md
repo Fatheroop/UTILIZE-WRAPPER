@@ -33,7 +33,7 @@ Train deep neural networks (MLPs, ConvNets, ResNets) progressively one layer at 
   - [`ConstructiveWrapper`](#constructivewrapper)
   - [`AutoConstructiveModel`](#autoconstructivemodel)
 - [Testing, Verification & Quality Assurance](#testing-verification--quality-assurance)
-  - [1. Comprehensive Unit Test Suite (18/18 Tests Passing)](#1-comprehensive-unit-test-suite-1818-tests-passing)
+  - [1. Comprehensive Unit Test Suite (19/19 Tests Passing)](#1-comprehensive-unit-test-suite-1919-tests-passing)
   - [2. System-Wide Verification Audit Records](#2-system-wide-verification-audit-records)
   - [3. How to Run the Verification Suite](#3-how-to-run-the-verification-suite)
 - [License](#license)
@@ -575,9 +575,9 @@ Automates layer-by-layer architectural and optimizer search using micro-batch to
 
 The framework features an automated, multi-tiered testing and verification infrastructure to mathematically guarantee zero regressions, numerical stability, export fidelity, and memory boundedness.
 
-### 1. Comprehensive Unit Test Suite (`test_suite.py`)
+### 1. Comprehensive Unit Test Suite (19/19 Tests Passing)
 
-All **18 automated unit tests pass with a 100% success rate** (3.84 seconds execution time):
+All **19 automated unit tests pass with a 100% success rate** (4.32 seconds execution time):
 
 | Test Module / Case | Focus Area | Status | Verified Behavior |
 |---|---|:---:|---|
@@ -599,6 +599,7 @@ All **18 automated unit tests pass with a 100% success rate** (3.84 seconds exec
 | `test_export_traced_and_quantized_models` | Production Export | **PASS** | TorchScript JIT tracing, dynamic INT8 quantization, and ONNX serialization. |
 | `test_gradient_accumulation_and_warmup` | Large Batch Simulation | **PASS** | Multi-batch gradient accumulation and linear warmup cosine learning rate scheduler. |
 | `test_selective_gradient_and_loss_gating` | Advanced Optimizations | **PASS** | Selective gradient gating, hard-negative loss gating, and curvature early stopping. |
+| `test_wrapper_save_load_and_guards` | Checkpoint & Guards | **PASS** | Instance `.save()` / `.load()`, classmethod `.load_from_checkpoint()`, and uninitialized guards. |
 
 ### 2. System-Wide Verification Audit Records (`scratch/verify_all_systems.py`)
 

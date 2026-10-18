@@ -1275,12 +1275,14 @@ class ConstructiveWrapper(nn.Module):
                     xs.append(batch["features"].cpu() if "features" in batch else batch["x"].cpu())
                     ys.append(batch["labels"].cpu() if "labels" in batch else batch["y"].cpu())
             tx = torch.cat(xs, dim=0).float()
+            if tx.ndim == 1:
+                tx = tx.unsqueeze(1)
             ty = torch.cat(ys, dim=0)
             if self.task == "classification":
                 ty = ty.long()
             else:
                 ty = ty.float()
-                if ty.ndim == 1 and self.num_classes == 1:
+                if ty.ndim == 1:
                     ty = ty.unsqueeze(1)
             return tx, ty
 
@@ -1289,12 +1291,15 @@ class ConstructiveWrapper(nn.Module):
             raise ValueError("Labels (y) must be provided when data is a Tensor or NumPy array.")
 
         tx = torch.from_numpy(data).float() if isinstance(data, np.ndarray) else data.float()
+        if tx.ndim == 1:
+            tx = tx.unsqueeze(1)
+
         if isinstance(y, np.ndarray):
             ty = torch.from_numpy(y).long() if self.task == "classification" else torch.from_numpy(y).float()
         else:
             ty = y.long() if self.task == "classification" else y.float()
 
-        if self.task == "regression" and ty.ndim == 1 and self.num_classes == 1:
+        if self.task == "regression" and ty.ndim == 1:
             ty = ty.unsqueeze(1)
 
         return tx, ty
@@ -1320,6 +1325,11 @@ class ConstructiveWrapper(nn.Module):
         vx, vy = (None, None)
         if val_data is not None:
             vx, vy = self._unpack_dataset(val_data, val_y)
+
+        if self.task == "regression" and not self.stages_wrapped:
+            target_dim = 1 if ty.ndim == 1 else ty.shape[1]
+            self.out_dim = target_dim
+            self.num_classes = target_dim
 
         if not self.stages_wrapped:
             self._initialize_stage_wrappers(tx[:2])
@@ -1451,8 +1461,7 @@ class ConstructiveWrapper(nn.Module):
 
         # Optional fast end-to-end fine-tuning to eliminate greedy suboptimality
         if self.fine_tune_epochs > 0:
-            actual_fine_tune_lr = self.fine_tune_lr if self.fine_tune_lr is not None else max(self.min_lr, self.learning_rate * 0.7)
-            self.fine_tune(tx, ty, vx, vy, epochs=self.fine_tune_epochs, lr=actual_fine_tune_lr, verbose=verbose)
+            self.fine_tune(tx, ty, vx, vy, epochs=self.fine_tune_epochs, lr=self.fine_tune_lr, verbose=verbose)
 
         if verbose:
             print("\n" + "=" * 65)
@@ -2361,6 +2370,9 @@ class ConstructiveWrapper(nn.Module):
         if self.task != "classification":
             raise ValueError("predict_proba is only available for classification tasks.")
 
+        if hasattr(x, "ndim") and x.ndim == 1:
+            x = x[:, None] if isinstance(x, np.ndarray) else x.unsqueeze(1)
+
         n = len(x)
         if n == 0:
             return np.empty((0, self.out_dim), dtype=np.float32)
@@ -2404,13 +2416,17 @@ class ConstructiveWrapper(nn.Module):
         Returns:
             np.ndarray: Model predictions (class indices for classification, continuous targets for regression).
         """
+        if hasattr(x, "ndim") and x.ndim == 1:
+            x = x[:, None] if isinstance(x, np.ndarray) else x.unsqueeze(1)
+
         n = len(x)
         if n == 0:
             return np.array([], dtype=np.int64 if self.task == "classification" else np.float32)
 
         eff_bs = batch_size or getattr(self, "inference_batch_size", 512)
         dtype = np.int64 if self.task == "classification" else np.float32
-        out_preds = np.empty(n, dtype=dtype)
+        out_shape = (n, self.out_dim) if (self.task == "regression" and self.out_dim > 1) else (n,)
+        out_preds = np.empty(out_shape, dtype=dtype)
         num_stages = len(self.stages_wrapped)
         self.eval()
 
@@ -2463,14 +2479,22 @@ class ConstructiveWrapper(nn.Module):
                     if self.task == "classification":
                         out_preds[i:end_i] = torch.argmax(out, dim=1).cpu().numpy()
                     else:
-                        out_preds[i:end_i] = out.squeeze().cpu().numpy()
+                        pred_slice = out.cpu().numpy()
+                        out_preds[i:end_i] = pred_slice.squeeze(-1) if self.out_dim == 1 else pred_slice
 
         return out_preds
 
     def evaluate(self, x: Union[np.ndarray, torch.Tensor], y: Union[np.ndarray, torch.Tensor]) -> float:
         """Evaluate model: returns accuracy for classification, R^2 score for regression."""
+        if hasattr(x, "ndim") and x.ndim == 1:
+            x = x[:, None] if isinstance(x, np.ndarray) else x.unsqueeze(1)
         preds = self.predict(x)
-        labels_np = y.cpu().numpy().squeeze() if isinstance(y, torch.Tensor) else np.asarray(y).squeeze()
+        labels_np = np.asarray(y.cpu() if isinstance(y, torch.Tensor) else y)
+        if preds.ndim == 1 and labels_np.ndim > 1:
+            labels_np = labels_np.squeeze()
+        elif preds.ndim > 1 and labels_np.ndim == 1:
+            labels_np = labels_np[:, None]
+
         if self.task == "classification":
             return float(np.mean(preds == labels_np))
         else:
@@ -2495,6 +2519,13 @@ class ConstructiveWrapper(nn.Module):
         Reassembles all stages and final classification head into a single standard nn.Sequential.
         Zero custom wrapper code or dependencies required for inference or deployment!
         """
+        if not self.stages_wrapped:
+            if self.in_shape is not None and self.stages_raw:
+                dummy = torch.zeros(1, *self.in_shape) if isinstance(self.in_shape, (tuple, list)) else torch.zeros(1, self.in_shape)
+                self._initialize_stage_wrappers(dummy)
+            else:
+                raise RuntimeError("Cannot export standard model: stages have not been initialized or fitted yet. Call fit() first or provide in_shape.")
+
         all_modules = []
         for s_idx, stage_w in enumerate(self.stages_wrapped):
             # Add body layers
@@ -2573,6 +2604,53 @@ class ConstructiveWrapper(nn.Module):
             "history": self.training_history,
         }
         torch.save(state, filepath)
+
+    def load(self, filepath: str, map_location: Optional[Union[str, torch.device]] = None) -> "ConstructiveWrapper":
+        """
+        Load a saved checkpoint into this ConstructiveWrapper instance.
+        """
+        ckpt = torch.load(filepath, map_location=map_location or self.device, weights_only=False)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            self.load_state_dict(ckpt["state_dict"], strict=False)
+            if "history" in ckpt:
+                self.training_history = ckpt["history"]
+        else:
+            self.load_state_dict(ckpt, strict=False)
+        self._invalidate_inference_engine()
+        return self
+
+    @classmethod
+    def load_from_checkpoint(
+        cls,
+        filepath: str,
+        model: Optional[Union[nn.Sequential, List[nn.Module]]] = None,
+        stages: Optional[List[nn.Module]] = None,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> "ConstructiveWrapper":
+        """
+        Instantiate a ConstructiveWrapper and load weights from a serialized checkpoint.
+        """
+        ckpt = torch.load(filepath, map_location=device or "cpu", weights_only=False)
+        in_shape = ckpt.get("in_shape", None) if isinstance(ckpt, dict) else None
+        num_classes = ckpt.get("num_classes", 10) if isinstance(ckpt, dict) else 10
+        task = ckpt.get("task", "classification") if isinstance(ckpt, dict) else "classification"
+        wrapper = cls(
+            model=model,
+            stages=stages,
+            in_shape=in_shape,
+            num_classes=num_classes,
+            task=task,
+            device=device,
+        )
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            if not wrapper.stages_wrapped and in_shape is not None and wrapper.stages_raw:
+                dummy = torch.zeros(1, *in_shape) if isinstance(in_shape, (tuple, list)) else torch.zeros(1, in_shape)
+                wrapper._initialize_stage_wrappers(dummy)
+            wrapper.load_state_dict(ckpt["state_dict"], strict=False)
+            wrapper.training_history = ckpt.get("history", [])
+        else:
+            wrapper.load_state_dict(ckpt, strict=False)
+        return wrapper
 
     def export_torchscript(self, filepath: str, example_input: Optional[torch.Tensor] = None):
         """Export the exported standard model to TorchScript JIT."""
@@ -3026,3 +3104,16 @@ class AutoConstructiveModel(nn.Module):
         if self.wrapper is None:
             raise RuntimeError("Model must be fitted via fit() before exporting.")
         self.wrapper.export_onnx(filepath, example_input=example_input)
+
+    def save(self, filepath: str):
+        """Save the fitted AutoConstructiveModel checkpoint."""
+        if self.wrapper is None:
+            raise RuntimeError("Model must be fitted via fit() before saving.")
+        self.wrapper.save(filepath)
+
+    def load(self, filepath: str, map_location: Optional[Union[str, torch.device]] = None) -> "AutoConstructiveModel":
+        """Load saved checkpoint weights into the underlying wrapper."""
+        if self.wrapper is None:
+            raise RuntimeError("Model must be initialized before loading checkpoint.")
+        self.wrapper.load(filepath, map_location=map_location)
+        return self

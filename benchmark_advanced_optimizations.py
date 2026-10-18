@@ -223,8 +223,9 @@ def plot_results(results):
 
     # Panel 2: Total Training Time (Wall Clock)
     ax2 = axes[0, 1]
-    bars_time = ax2.bar(names, times, color=colors, alpha=0.85, edgecolor="#94a3b8", width=0.55)
+    bars_time = ax2.bar(x, times, color=colors, alpha=0.85, edgecolor="#94a3b8", width=0.55)
     ax2.set_title("Wall-Clock Training Time (seconds)", color="#f8fafc", fontsize=12, fontweight="bold", pad=10)
+    ax2.set_xticks(x)
     ax2.set_xticklabels(names, rotation=15, ha="right", color="#cbd5e1")
     ax2.set_ylabel("Seconds (Lower is Better)", color="#cbd5e1")
     ax2.grid(axis="y", linestyle="--", alpha=0.2, color="#94a3b8")
@@ -234,9 +235,10 @@ def plot_results(results):
 
     # Panel 3: Relative Speedup (Multiplier)
     ax3 = axes[1, 0]
-    bars_sp = ax3.bar(names, speedups, color="#8b5cf6", alpha=0.85, edgecolor="#c084fc", width=0.55)
+    bars_sp = ax3.bar(x, speedups, color="#8b5cf6", alpha=0.85, edgecolor="#c084fc", width=0.55)
     ax3.axhline(1.0, color="#ef4444", linestyle="--", label="Baseline (1.0x)")
     ax3.set_title("Training Speedup Multiplier vs. Baseline", color="#f8fafc", fontsize=12, fontweight="bold", pad=10)
+    ax3.set_xticks(x)
     ax3.set_xticklabels(names, rotation=15, ha="right", color="#cbd5e1")
     ax3.set_ylabel("Speedup Multiplier (Higher is Better)", color="#cbd5e1")
     ax3.legend(facecolor="#0f172a", edgecolor="#334155", labelcolor="#f8fafc", loc="upper left")
@@ -247,8 +249,9 @@ def plot_results(results):
 
     # Panel 4: Epoch Convergence Efficiency
     ax4 = axes[1, 1]
-    bars_ep = ax4.bar(names, epochs, color="#f59e0b", alpha=0.85, edgecolor="#fbbf24", width=0.55)
+    bars_ep = ax4.bar(x, epochs, color="#f59e0b", alpha=0.85, edgecolor="#fbbf24", width=0.55)
     ax4.set_title("Total Epochs Trained Across Stages", color="#f8fafc", fontsize=12, fontweight="bold", pad=10)
+    ax4.set_xticks(x)
     ax4.set_xticklabels(names, rotation=15, ha="right", color="#cbd5e1")
     ax4.set_ylabel("Epochs (Adaptive Saturation)", color="#cbd5e1")
     ax4.grid(axis="y", linestyle="--", alpha=0.2, color="#94a3b8")

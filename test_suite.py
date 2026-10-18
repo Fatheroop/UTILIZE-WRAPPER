@@ -687,6 +687,67 @@ class TestConstructiveModules(unittest.TestCase):
             wrapper_preds = wrapper.predict(X[:20].numpy())
             np.testing.assert_array_equal(wrapper_preds, std_preds)
 
+    def test_wrapper_save_load_and_guards(self):
+        """Test ConstructiveWrapper save, load, and safety guards on uninitialized models."""
+        X = np.random.randn(80, 4).astype(np.float32)
+        y = (X[:, 0] > 0).astype(np.int64)
+
+        # 1. Test safety guard: uninitialized get_standard_model raises RuntimeError when in_shape is missing
+        empty_wrapper = ConstructiveWrapper(task="classification")
+        with self.assertRaises(RuntimeError):
+            empty_wrapper.get_standard_model()
+
+        # 2. Train a small wrapper model
+        model = torch.nn.Sequential(
+            torch.nn.Linear(4, 16),
+            torch.nn.ReLU(),
+            torch.nn.Linear(16, 2),
+        )
+        wrapper = ConstructiveWrapper(
+            model=model,
+            in_shape=(4,),
+            num_classes=2,
+            max_epochs_per_stage=3,
+            fine_tune_epochs=1,
+            random_state=42,
+        )
+        wrapper.fit(X, y, verbose=False)
+        orig_preds = wrapper.predict(X)
+
+        # 3. Test instance save & load
+        save_path = os.path.join(self.test_dir, "wrapper_checkpoint.pt")
+        wrapper.save(save_path)
+        self.assertTrue(os.path.exists(save_path))
+
+        # Re-load into fresh wrapper
+        fresh_model = torch.nn.Sequential(
+            torch.nn.Linear(4, 16),
+            torch.nn.ReLU(),
+            torch.nn.Linear(16, 2),
+        )
+        new_wrapper = ConstructiveWrapper(
+            model=fresh_model,
+            in_shape=(4,),
+            num_classes=2,
+            random_state=42,
+        )
+        new_wrapper.fit(X[:2], y[:2], verbose=False) # initialize stages
+        new_wrapper.load(save_path)
+        loaded_preds = new_wrapper.predict(X)
+        np.testing.assert_array_equal(orig_preds, loaded_preds)
+
+        # 4. Test classmethod load_from_checkpoint
+        loaded_from_class = ConstructiveWrapper.load_from_checkpoint(
+            save_path,
+            model=torch.nn.Sequential(
+                torch.nn.Linear(4, 16),
+                torch.nn.ReLU(),
+                torch.nn.Linear(16, 2),
+            ),
+        )
+        class_preds = loaded_from_class.predict(X)
+        np.testing.assert_array_equal(orig_preds, class_preds)
+
 
 if __name__ == "__main__":
     unittest.main()
